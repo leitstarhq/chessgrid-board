@@ -1,317 +1,278 @@
-# ChessGrid General Move Detection
+# ChessGrid Move Detection
 
 ## Overview
 
-ChessGrid Board detects chess moves by monitoring changes across 64 board sensors.
+ChessGrid detects chess moves by observing changes in the state of the 64 board sensors.
 
-The movement detection system is designed around a **general sensor-delta logic** rather than separate detection algorithms for each chess move type.
+The movement detection system is designed around a simple principle:
 
-The firmware compares the current sensor state against the previously validated board position, called the **baseline**.
+> **Translate physical sensor-state changes into a UCI move candidate, then let the chess library determine whether the move is legal.**
 
-From these physical changes, the firmware determines:
-
-* Which square was left first
-* Which previously empty square became occupied
-* Which previously occupied square was disturbed
-* Whether the movement represents a candidate chess move
-
-The resulting move is then validated by `chess.hpp`.
-
-This separation allows the same detection system to support normal moves, captures, en passant, castling, and promotion.
+The firmware does not attempt to understand chess rules during movement detection.
 
 ---
 
-## Baseline
+## Design Principle
 
-After a valid chess move has been completed, the current 64-square sensor state becomes the new baseline.
+The movement detection system does not attempt to understand chess rules.
 
-The baseline represents the last known valid physical board position.
+Its primary responsibility is to translate changes in the 64 sensor states into a **UCI move candidate**.
 
 ```text
-Valid Chess Position
-        │
-        ▼
-  Sensor State
-        │
-        ▼
-     Baseline
+Sensor States
+      ↓
+Movement Detection
+      ↓
+UCI Move Candidate
+      ↓
+chess.hpp
+      ↓
+Legal / Illegal
 ```
 
-Every subsequent sensor change is interpreted relative to this baseline.
+The movement detector is therefore concerned with **physical board behavior**, not chess legality.
 
----
-
-## Movement State Machine
-
-Movement detection uses four states:
+For example, if the physical board indicates that a piece moved from `e5` to `d6`, the movement detector produces:
 
 ```text
-WAITING_FOR_POSITION
-        │
-        ▼
-      READY
-        │
-        │ first piece lifted
-        ▼
-    MOVEMENT
-        │
-        ├── valid move ──→ READY
-        │
-        ├── board restored → READY
-        │
-        └── illegal move ─→ RECOVERY
-                              │
-                              │ board restored
-                              ▼
-                            READY
+e5d6
 ```
 
-### `WAITING_FOR_POSITION`
+It does not need to determine whether the move is:
 
-The board is not currently in a valid starting position.
+* a normal pawn move
+* a capture
+* an en passant capture
 
-No movement is processed until the expected position is detected.
+That decision is delegated to `chess.hpp`.
 
-### `READY`
+Likewise, the movement detector does not need separate chess-rule logic for:
 
-The board is stable and ready for the next move.
+* castling
+* promotion legality
+* check
+* pinned pieces
+* blocked pieces
+* castling rights
+* en passant rules
 
-### `MOVEMENT`
+The movement detector only needs to correctly translate the physical board changes into the appropriate UCI candidate.
 
-A piece has been detected leaving its source square.
-
-The firmware records movement information while waiting for the player to complete the move and press the clock.
-
-### `RECOVERY`
-
-The detected movement was invalid.
-
-The player must return the board to the previous valid position.
-
-Once the board matches the baseline again, the system returns to `READY`.
+This separation keeps the sensor layer general while allowing `chess.hpp` to remain responsible for chess rules and move legality.
 
 ---
 
-# Movement Tracking
+## Baseline State
 
-The firmware maintains three important movement variables:
+After every valid move, the firmware stores the current sensor state as the new **baseline**.
+
+The baseline represents the last known valid chess position.
+
+Each sensor therefore has two relevant states:
+
+```text
+baselineState[]
+sensorState[]
+```
+
+The movement detector compares changes in `sensorState` against the baseline.
+
+Conceptually:
+
+```text
+Previous Valid Position
+        ↓
+      Baseline
+        ↓
+Sensor State Changes
+        ↓
+Movement Candidate
+```
+
+The detector does not need to continuously reconstruct the entire chess position from scratch.
+
+It only needs to understand how the current physical changes relate to the previous valid position.
+
+---
+
+## Movement Tracking
+
+Three variables form the core of the movement detection system:
 
 ```cpp
-int movementSource = -1;
-int firstDestination = -1;
-int lastDisturbed = -1;
-```
-
-Each variable represents a different physical event.
-
----
-
-## 1. Movement Source
-
-The first square that changes from:
-
-```text
-ON → OFF
-```
-
-while the board is in `READY` is considered the movement source.
-
-The source is immediately locked.
-
-```text
-ON → OFF
-    │
-    ▼
 movementSource
-    │
-    ▼
-SOURCE LOCKED
+firstDestination
+lastDisturbed
 ```
 
-Once locked, subsequent disturbances cannot replace the source.
+### `movementSource`
 
-This is important because a single chess move can cause several sensor transitions, especially during captures and castling.
+The source is identified when a square that was occupied in the baseline changes:
+
+```text
+ON → OFF
+```
+
+Because chess pieces are assumed to be lifted before being placed elsewhere, this transition identifies the square from which the piece was removed.
+
+Once detected, the source is locked.
+
+```text
+baseline: ON
+current:  OFF
+
+        ↓
+
+movementSource = square
+```
 
 ---
 
-# 2. First Destination
+### `firstDestination`
 
-A square that was **empty in the baseline** and changes from:
+The first previously-empty square that becomes occupied is detected as:
 
 ```text
 OFF → ON
 ```
 
-is considered a destination candidate.
-
-The first such square detected is stored as:
-
-```cpp
-firstDestination
-```
-
-The firmware does not replace it with later OFF → ON transitions.
-
-Conceptually:
+This square becomes `firstDestination`.
 
 ```text
-Baseline: OFF
-Current:  ON
-          │
-          ▼
-firstDestination
+baseline: OFF
+current:  ON
+
+        ↓
+
+firstDestination = square
 ```
 
-This simple rule is particularly useful for castling and en passant.
+The first such transition is preserved because, for several chess moves, it represents the square where the moving piece is intended to arrive.
 
 ---
 
-# 3. Last Disturbed
+### `lastDisturbed`
 
-The firmware also tracks a different type of event:
+After the source has been identified, additional previously-occupied squares may become empty:
 
 ```text
-Baseline: ON
-Current:  OFF
+ON → OFF
 ```
 
-This represents a square that was occupied in the previous valid position but has subsequently been disturbed.
+These are tracked as disturbances.
 
-Such a square is stored as:
+The latest such square, excluding the source itself, is stored as:
 
 ```cpp
 lastDisturbed
 ```
 
-The source square itself is excluded from this tracking.
-
-Conceptually:
-
-```text
-Baseline: ON
-Current:  OFF
-          │
-          ▼
-lastDisturbed
-```
-
-The distinction between `firstDestination` and `lastDisturbed` is fundamental to the movement detection system.
-
-```text
-firstDestination
-    = previously empty → now occupied
-
-lastDisturbed
-    = previously occupied → now empty
-```
+This is particularly useful for captures where the destination square was already occupied.
 
 ---
 
-# Normal Move
+# Translating Sensor States into UCI
 
-Consider:
+The movement detector ultimately needs to produce only a UCI move candidate.
+
+The general process is:
+
+```text
+Sensor State Changes
+        ↓
+Identify Source
+        ↓
+Identify Destination / Disturbed Square
+        ↓
+Construct UCI
+        ↓
+chess.hpp
+```
+
+The detector does not classify the chess move itself.
+
+---
+
+## Normal Move
+
+For a normal move:
+
+```text
+Source:      ON → OFF
+Destination: OFF → ON
+```
+
+The resulting UCI candidate is:
+
+```text
+source + destination
+```
+
+Example:
 
 ```text
 e2 → e4
 ```
 
-Initial baseline:
-
-```text
-e2 = ON
-e4 = OFF
-```
-
-The physical changes are:
-
-```text
-e2: ON → OFF
-e4: OFF → ON
-```
-
-The firmware records:
-
-```text
-movementSource  = e2
-firstDestination = e4
-```
-
-The resulting candidate move is:
+produces:
 
 ```text
 e2e4
 ```
 
-It is then passed to `chess.hpp` for legality validation.
-
 ---
 
-# Capture
+## Normal Capture
 
-Consider:
+For a normal capture, the destination square was already occupied.
 
-```text
-e4 × d5
-```
+Therefore, the destination does not produce an `OFF → ON` transition.
 
-Initial baseline:
+Instead, the captured piece is removed:
 
 ```text
-e4 = ON
-d5 = ON
+Source:        ON → OFF
+Destination:   ON
+Captured piece: ON → OFF
 ```
 
-Because the destination was already occupied, it does not produce the normal:
+The detector therefore uses `lastDisturbed` to identify the occupied square that was disturbed after the source was removed.
+
+Conceptually:
 
 ```text
-OFF → ON
+movementSource → lastDisturbed
 ```
 
-destination transition.
+The resulting UCI candidate is then passed to `chess.hpp`.
 
-Instead, the captured piece produces:
+Example:
 
 ```text
-d5: ON → OFF
+e4xd5
 ```
 
-This is recorded as a disturbance.
-
-The resulting movement information is:
-
-```text
-movementSource = e4
-lastDisturbed  = d5
-```
-
-When the clock is clicked, the firmware uses `lastDisturbed` as the destination if no `firstDestination` exists.
-
-```text
-source → lastDisturbed
-```
-
-Result:
+produces:
 
 ```text
 e4d5
 ```
 
+The movement detector does not need to label this as a capture. `chess.hpp` determines that from the current chess position.
+
 ---
 
-# En Passant
+## En Passant
 
-En passant is one of the most important reasons for maintaining both `firstDestination` and `lastDisturbed`.
+En passant is an important example of why the movement detector does not need dedicated chess-rule logic.
 
 Consider:
 
 ```text
-White pawn: e5
-Black pawn: d5
-
-White plays: exd6
+e5xd6 e.p.
 ```
 
-Baseline:
+Before the move:
 
 ```text
 e5 = ON
@@ -319,7 +280,7 @@ d5 = ON
 d6 = OFF
 ```
 
-After the move:
+Physical changes occur approximately as:
 
 ```text
 e5: ON → OFF
@@ -327,245 +288,339 @@ d6: OFF → ON
 d5: ON → OFF
 ```
 
-The firmware therefore records:
+The detector therefore records:
 
 ```text
-movementSource  = e5
+movementSource = e5
 firstDestination = d6
-lastDisturbed    = d5
+lastDisturbed = d5
 ```
 
-The important point is that **`d5` is not the destination**.
-
-It is the captured pawn's square.
-
-The actual destination is `d6`, which is identified by the OFF → ON transition.
-
-Because `firstDestination` exists, it takes priority over `lastDisturbed`.
-
-Therefore:
+The UCI candidate becomes:
 
 ```text
-e5 → d6
+e5d6
 ```
 
-is generated rather than:
+The detector does not need an `if (enPassant)` condition.
+
+`chess.hpp` receives:
 
 ```text
-e5 → d5
+e5d6
 ```
 
-`chess.hpp` then determines whether `e5d6` is a legal en passant move.
+and, given the current board position, determines that this is a legal en passant capture.
 
-No dedicated en passant sensor algorithm is required.
+The physical movement pattern therefore naturally produces the correct UCI move.
 
 ---
 
-# Castling
+## Castling
 
-Castling moves two pieces and therefore creates multiple physical changes.
+Castling produces multiple sensor changes because both the king and rook move.
 
-For example, king-side castling produces two previously empty squares becoming occupied.
-
-The sensor layer may therefore detect:
+For example, kingside castling:
 
 ```text
-OFF → ON
-OFF → ON
+e1 → g1
+h1 → f1
 ```
 
-Rather than creating a special sensor rule for castling, ChessGrid uses the same general destination logic.
-
-The **first detected OFF → ON square** is retained as:
+The detector may observe:
 
 ```text
-firstDestination
+e1: ON → OFF
+g1: OFF → ON
+h1: ON → OFF
+f1: OFF → ON
 ```
 
-This provides the king's destination.
-
-The resulting move is then validated by `chess.hpp`, which understands the castling rule and updates the chess position accordingly.
-
-The sensor layer therefore does not need to explicitly determine:
+The first destination detected is:
 
 ```text
-"This is castling."
+g1
 ```
 
-It only needs to identify the physical movement.
+Therefore the movement candidate is:
+
+```text
+e1g1
+```
+
+The detector does not need to recognize that two pieces moved or explicitly implement castling logic.
+
+`chess.hpp` interprets `e1g1` according to the current chess position and performs the appropriate legal castling move, including the rook movement.
 
 ---
 
-# Promotion
+## Promotion
 
-Promotion uses the same source and destination detection system as a normal pawn move.
+Promotion uses the same source/destination detection mechanism.
 
-The only additional information required is the desired promotion piece.
+The only additional information required is the promotion piece.
 
-The firmware accepts four promotion modifiers:
-
-```text
-N = Knight
-B = Bishop
-R = Rook
-Q = Queen
-```
-
-The modifier is appended to the generated UCI move.
-
-Examples:
+The firmware supports:
 
 ```text
-e7e8q
-e7e8r
-e7e8b
-e7e8n
-```
-
-This allows the player to select the promotion piece while keeping the underlying movement detection completely general.
-
----
-
-# Move Candidate Resolution
-
-When the player presses the clock, the firmware resolves the movement information.
-
-The basic priority is:
-
-```text
-1. movementSource
-2. firstDestination
-3. lastDisturbed
-```
-
-In simplified form:
-
-```text
-source = movementSource
-
-if firstDestination exists:
-    destination = firstDestination
-
-else if lastDisturbed exists:
-    destination = lastDisturbed
-
-else:
-    movement is invalid
-```
-
-This produces a source/destination candidate that can be converted into UCI notation.
-
----
-
-# Movement Cancellation
-
-A movement can be cancelled simply by returning the board to its previous state.
-
-The firmware continuously compares the current sensor state against the baseline.
-
-If:
-
-```text
-current sensor state == baseline
-```
-
-the movement is considered cancelled.
-
-The movement tracking variables are cleared and the board returns to:
-
-```text
-READY
-```
-
-This allows a player to lift a piece and put it back without generating a chess move.
-
----
-
-# Chess Validation
-
-The sensor system intentionally does **not** determine chess legality.
-
-After the movement candidate is resolved, the firmware creates a UCI move:
-
-```text
-source + destination + optional promotion modifier
+n = Knight
+b = Bishop
+r = Rook
+q = Queen
 ```
 
 For example:
 
 ```text
-e2e4
-e7e8q
-e1g1
-e5d6
+e7 → e8
 ```
 
-The move is then passed to `chess.hpp`.
+with queen promotion produces:
 
 ```text
-Physical Board
-      │
-      ▼
-Sensor Changes
-      │
-      ▼
-Movement Candidate
-      │
-      ▼
-UCI Move
-      │
-      ▼
-   chess.hpp
-      │
-   ┌──┴──┐
-   ▼     ▼
- LEGAL  ILLEGAL
-   │       │
-   ▼       ▼
-Update   Recovery
-Board
+e7e8q
 ```
 
-For a legal move:
+The promotion modifier is appended to the UCI candidate before it is passed to `chess.hpp`.
 
-1. The chess position is updated.
-2. The current sensor state becomes the new baseline.
-3. Movement tracking is cleared.
-4. The promotion modifier is cleared.
-5. The UCI move is sent to ChessGrid Live.
-6. The board returns to `READY`.
-
-For an illegal move:
-
-1. The move is rejected.
-2. Movement tracking is cleared.
-3. The board enters `RECOVERY`.
-4. The player must return the physical board to the previous valid position.
+Again, the movement detector does not need to determine whether promotion is legal. It only supplies the requested UCI move.
 
 ---
 
-# Design Principle
+# Movement Cancellation
 
-The core design principle of ChessGrid Board is the separation between **physical movement detection** and **chess interpretation**.
+A movement can be cancelled if the board returns to the baseline state before a move is committed.
 
-The sensor layer answers:
+The firmware continuously checks:
 
-> **What physically changed on the board?**
+```cpp
+boardMatchesBaseline()
+```
 
-The chess library answers:
+If every sensor matches the baseline again:
 
-> **What chess move does this represent, and is that move legal?**
+```text
+Current State == Baseline State
+```
 
-This separation allows the same movement detection engine to handle:
+the movement is cleared and the board returns to:
 
-* Normal moves
-* Captures
-* En passant
-* Castling
-* Promotion
-* Movement cancellation
-* Illegal moves and recovery
+```text
+READY
+```
 
-without requiring a separate sensor-detection algorithm for each chess rule.
+This allows a user to temporarily lift a piece and return it to its original square without generating a move.
 
-The result is a general-purpose movement detection layer that converts physical board activity into validated chess moves.
+---
+
+# Illegal Move and Recovery
+
+After constructing a UCI candidate, the firmware passes it to `chess.hpp`.
+
+Conceptually:
+
+```text
+UCI Candidate
+      ↓
+chess.hpp
+      ↓
+Legal?
+   /     \
+ YES      NO
+ ↓        ↓
+Commit   Recovery
+```
+
+If the move is legal:
+
+1. The chess board state is updated.
+2. The UCI move is sent to ChessGrid Live.
+3. The current sensor state becomes the new baseline.
+4. Movement tracking is cleared.
+5. The state returns to `READY`.
+
+If the move is illegal:
+
+1. The movement is rejected.
+2. The firmware enters `RECOVERY`.
+3. The board must return to the baseline position before normal movement detection resumes.
+
+This prevents an illegal physical arrangement from silently becoming the new chess state.
+
+---
+
+# State Machine
+
+The movement detector uses four primary states:
+
+```text
+WAITING_FOR_POSITION
+        ↓
+      READY
+        ↓
+    MOVEMENT
+        ↓
+      READY
+```
+
+An illegal move enters:
+
+```text
+MOVEMENT
+    ↓
+RECOVERY
+    ↓
+READY
+```
+
+### `WAITING_FOR_POSITION`
+
+Initial state.
+
+The firmware waits until the physical board represents a valid starting position.
+
+---
+
+### `READY`
+
+The board is synchronized with the current chess state and is ready for a new movement.
+
+---
+
+### `MOVEMENT`
+
+A physical movement has been detected.
+
+The firmware tracks:
+
+```text
+movementSource
+firstDestination
+lastDisturbed
+```
+
+until the movement is committed, cancelled, or rejected.
+
+---
+
+### `RECOVERY`
+
+The physical board does not represent a valid committed chess position.
+
+The firmware waits until the sensors once again match the baseline.
+
+Only then does it return to `READY`.
+
+---
+
+# Move Processing
+
+Once a movement has been identified, the firmware constructs a UCI string.
+
+Conceptually:
+
+```text
+Source
+  +
+Destination
+  +
+Optional Promotion Modifier
+        ↓
+      UCI
+```
+
+For example:
+
+```text
+e2 + e4
+    ↓
+e2e4
+```
+
+or:
+
+```text
+e7 + e8 + q
+    ↓
+e7e8q
+```
+
+The resulting UCI candidate is passed to `chess.hpp`.
+
+A legal move is then committed to the internal chess board.
+
+---
+
+# Why This Approach Is General
+
+The important property of this design is that the movement detector does not contain separate algorithms for every chess move type.
+
+Instead, it operates on a small number of physical transition patterns:
+
+```text
+ON → OFF
+OFF → ON
+```
+
+and tracks their relationship to the baseline.
+
+The chess library then provides the chess-specific interpretation.
+
+This means the same movement detection mechanism can support:
+
+```text
+Normal moves
+Captures
+En passant
+Castling
+Promotion
+```
+
+without requiring dedicated sensor logic for each chess rule.
+
+The architecture can therefore be summarized as:
+
+```text
+             PHYSICAL BOARD
+                    │
+                    ▼
+             Sensor States
+                    │
+                    ▼
+          Movement Detection
+                    │
+                    ▼
+             UCI Candidate
+                    │
+                    ▼
+               chess.hpp
+                    │
+              ┌─────┴─────┐
+              ▼           ▼
+           Legal        Illegal
+              │           │
+              ▼           ▼
+        Commit Move    Recovery
+              │
+              ▼
+       Save New Baseline
+```
+
+---
+
+# Summary
+
+ChessGrid's movement detection is intentionally **not a chess engine**.
+
+Its responsibility is limited to:
+
+1. Observe changes in the 64 sensor states.
+2. Compare those changes against the previous valid baseline.
+3. Identify the movement source.
+4. Identify the destination or relevant disturbance.
+5. Translate the physical movement into a UCI move candidate.
+6. Pass that candidate to `chess.hpp`.
+
+`chess.hpp` is responsible for determining whether the resulting UCI move is legal and for applying the corresponding chess rules.
+
+This separation allows the physical sensor layer to remain simple and general while the chess library handles the complexity of chess itself.
