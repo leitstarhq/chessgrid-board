@@ -2,19 +2,21 @@
 
 ESP32 firmware for the ChessGrid electronic chessboard.
 
-ChessGrid Board is responsible for detecting chess piece movement, maintaining the current board state, validating chess moves, and communicating with ChessGrid Live.
+ChessGrid Board is responsible for detecting physical chess piece movement, maintaining the board state, validating chess moves, and communicating with ChessGrid Live.
 
 ## Status
 
 **Current version: `v0.1.0-alpha`**
 
-ChessGrid Board is currently in the alpha / proof-of-concept stage.
+ChessGrid Board is currently in the **Alpha / Proof-of-Concept** stage.
 
-The current firmware establishes the core chess logic, movement detection, and communication pipeline using a simulated reed switch input layer. Physical sensor and MUX integration are still under development.
+The core chess logic, movement detection, and communication pipeline are functional using a simulated sensor input layer. Physical reed switch and MUX integration are still under development.
+
+---
 
 ## Architecture
 
-```text id="7y3x8q"
+```text
 Reed Switch Input
     (Simulation)
           │
@@ -26,7 +28,7 @@ Reed Switch Input
           ├── Movement Detection
           │
           ├── chess.hpp
-          │     └── Chess logic & legal moves
+          │     └── Chess Logic & Validation
           │
           └── WebSocket
                   │
@@ -34,53 +36,121 @@ Reed Switch Input
           ChessGrid Live
 ```
 
+---
+
 ## Features
 
 * ESP32-based chessboard controller
-* 64-square reed switch input simulation
+* 64-square sensor input simulation
 * Chess position tracking
-* Movement detection using a state machine
+* General movement detection
+* Source square locking
+* Destination detection
+* Capture detection
+* En passant support
+* Castling support
+* Promotion support
+* Movement cancellation
+* Illegal move recovery
 * Legal move validation using `chess.hpp`
 * UCI move generation
-* Capture detection
-* Castling detection
-* Promotion handling
-* Board reset handling
+* Promotion modifiers (`N`, `B`, `R`, `Q`)
 * WiFi configuration and connection
 * mDNS support
 * WebSocket communication with ChessGrid Live
-* Device identification and authorization
-* Live move transmission to ChessGrid Live
+* Device identification
+* Server authorization flow
+* Live move transmission
+
+---
+
+## General Move Detection
+
+ChessGrid Board uses a **general sensor-delta movement detection system**.
+
+Instead of implementing separate sensor algorithms for normal moves, captures, en passant, castling, and promotion, the firmware observes changes from the previous valid board position (**baseline**) and produces a movement candidate.
+
+The core movement tracking uses:
+
+```text
+movementSource
+firstDestination
+lastDisturbed
+```
+
+The first **ON → OFF** transition identifies and locks the source.
+
+The first previously-empty square that changes **OFF → ON** becomes `firstDestination`.
+
+Previously-occupied squares that subsequently change **ON → OFF** are tracked as `lastDisturbed`.
+
+This allows the same detection system to handle different types of chess moves.
+
+For example:
+
+```text
+Normal move:
+source → firstDestination
+
+Capture:
+source → lastDisturbed
+
+En passant:
+source → firstDestination
+              +
+       lastDisturbed = captured pawn
+
+Castling:
+source → firstDestination
+```
+
+The resulting movement candidate is converted into UCI notation and validated by `chess.hpp`.
+
+### Detailed Documentation
+
+For the complete movement detection design, state machine, baseline handling, capture logic, en passant handling, castling, promotion, and recovery behavior:
+
+**[General Move Detection](docs/MOVE_DETECTION.md)**
+
+---
 
 ## Chess Logic
 
-ChessGrid Board uses [`chess.hpp`](https://github.com/Disservin/chess-library) for chess game logic and legal move validation.
+ChessGrid Board uses `chess.hpp` for chess game logic and legal move validation.
 
-The firmware converts detected board movements into UCI moves such as:
+The firmware converts detected physical movements into UCI moves such as:
 
-```text id="2h2kqk"
+```text
 e2e4
 e7e5
 g1f3
 ```
 
-Special moves such as castling, captures, and promotion are handled by the board state and movement detection logic before the resulting UCI move is sent to ChessGrid Live.
+Special moves including captures, en passant, castling, and promotion are validated by the chess library rather than being implemented as separate physical sensor rules.
 
-## Movement Detection
+---
 
-The firmware uses a state machine to interpret changes in the 64-square board state.
+## Promotion
 
-The current implementation handles:
+Promotion moves support the standard UCI promotion modifiers:
 
-* Normal moves
-* Captures
-* Castling
-* Promotion
-* Movement cancellation
-* Board state recovery
-* Baseline position tracking
+```text
+N = Knight
+B = Bishop
+R = Rook
+Q = Queen
+```
 
-The current reed switch layer is simulated for software development and testing.
+Examples:
+
+```text
+e7e8q
+e7e8r
+e7e8b
+e7e8n
+```
+
+---
 
 ## Communication
 
@@ -88,7 +158,7 @@ ChessGrid Board communicates with ChessGrid Live through WebSocket.
 
 ### ESP32 → Server
 
-```text id="q4by6g"
+```text
 HELLO <device_id>
 <uci_move>
 RESET
@@ -96,7 +166,7 @@ RESET
 
 Example:
 
-```text id="s2rj8e"
+```text
 HELLO CG-1
 e2e4
 RESET
@@ -104,30 +174,34 @@ RESET
 
 ### Server → ESP32
 
-The board currently handles messages including:
-
-```text id="x1h8l4"
+```text
 PENDING
 ACCEPTED
 REJECTED
 ERROR <message>
 ```
 
+The server authorization system prevents unapproved ChessGrid boards from interacting with the live server.
+
+---
+
 ## WiFi
 
-The ESP32 supports WiFi configuration and connection to a local router.
+The ESP32 supports WiFi configuration through the board's configuration interface.
 
-The board can start an access point for initial configuration before connecting to the configured WiFi network.
+The board can start an access point for initial network configuration before connecting to the configured WiFi network.
 
-mDNS is also used when available to provide local network discovery.
+mDNS support is also included for local network discovery.
+
+---
 
 ## Hardware
 
-The physical ChessGrid sensor system is still under development.
+The physical sensor system is still under development.
 
-Planned hardware architecture:
+The planned hardware architecture is:
 
-```text id="6d5b3q"
+```text
 64 × Reed Switches
         │
         ▼
@@ -137,48 +211,42 @@ Planned hardware architecture:
       ESP32
 ```
 
-The current firmware does not yet represent the final physical implementation.
+The current firmware uses a **simulated sensor input layer** for development and testing.
 
 Planned hardware work includes:
 
 * Physical reed switch integration
 * MUX integration
 * PCB design
-* Magnet and reed switch positioning
+* Magnet positioning
 * Sensor calibration
-* Power system
+* Power management
 * Mechanical board construction
+
+---
 
 ## Requirements
 
 * ESP32
 * Arduino framework
 * `chess.hpp`
-* WiFi-capable local network
+* WiFi network
 * ChessGrid Live server
+
+---
 
 ## Project Structure
 
-```text id="b4r1qy"
+```text
 chessgrid-board/
 ├── chessgrid.ino
 ├── chess.hpp
+├── docs/
+│   └── MOVE_DETECTION.md
 └── README.md
 ```
 
-Additional source files may be added as the firmware architecture evolves.
-
-## Versioning
-
-ChessGrid Board follows semantic versioning.
-
-Current release:
-
-```text id="x5k2s9"
-v0.1.0-alpha
-```
-
-Alpha releases may introduce changes to the firmware architecture, sensor interface, and communication protocol.
+---
 
 ## Related Project
 
@@ -187,6 +255,18 @@ The server and browser interface are maintained separately:
 **ChessGrid Live**
 
 `chessgrid-live`
+
+---
+
+## Version
+
+```text
+v0.1.0-alpha
+```
+
+This release represents the first functional software prototype of ChessGrid Board, establishing the core chess logic, movement detection, and communication pipeline before physical sensor integration.
+
+---
 
 ## License
 
