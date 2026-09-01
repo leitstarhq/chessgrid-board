@@ -62,7 +62,7 @@ This separation keeps the sensor layer general while allowing `chess.hpp` to rem
 
 ---
 
-## Baseline State
+# Baseline State
 
 After every valid move, the firmware stores the current sensor state as the new **baseline**.
 
@@ -119,7 +119,7 @@ ON → OFF
 
 Because a chess piece is expected to be lifted before being placed elsewhere, this transition identifies the square from which the piece was removed.
 
-Once detected, the source is locked.
+The first valid source transition **locks the movement source**.
 
 ```text
 Baseline: ON
@@ -128,9 +128,63 @@ Current:  OFF
         ↓
 
 movementSource = square
+        ↓
+     SOURCE LOCK
 ```
 
-The first valid `ON → OFF` transition establishes the movement source.
+Once locked, subsequent `ON → OFF` transitions are no longer considered possible movement sources.
+
+This is important because some chess moves temporarily produce more than one occupied square becoming empty.
+
+---
+
+## Source Lock
+
+Source lock establishes which piece is being moved before interpreting subsequent sensor changes.
+
+Consider an en passant capture:
+
+```text
+e5xd6 e.p.
+```
+
+The physical board may produce:
+
+```text
+e5: ON → OFF
+d6: OFF → ON
+d5: ON → OFF
+```
+
+Without source lock, both `e5` and `d5` could appear to be candidate sources because both were occupied and both become empty.
+
+With source lock:
+
+```text
+e5: ON → OFF
+        ↓
+movementSource = e5
+        ↓
+SOURCE LOCK
+```
+
+When `d5` later changes:
+
+```text
+d5: ON → OFF
+```
+
+it cannot become another source.
+
+It is instead interpreted as a **disturbance** and stored as:
+
+```text
+lastDisturbed = d5
+```
+
+This distinction is fundamental to the movement detection system.
+
+The first valid source transition establishes the moving piece. All subsequent occupied-square removals are interpreted relative to that locked source.
 
 ---
 
@@ -150,7 +204,7 @@ firstDestination
 
 and is **locked as the movement destination**.
 
-Subsequent `OFF → ON` transitions are not used to replace `firstDestination`.
+Subsequent `OFF → ON` transitions do not replace `firstDestination`.
 
 ```text
 Baseline: OFF
@@ -161,7 +215,7 @@ Current:  ON
 firstDestination = square
 ```
 
-This distinction is important because some chess moves produce more than one `OFF → ON` transition.
+This is important because some chess moves produce more than one `OFF → ON` transition.
 
 ### Castling Example
 
@@ -185,7 +239,7 @@ firstDestination = g1
 
 The later `f1: OFF → ON` transition does not change the destination.
 
-The resulting UCI candidate is therefore:
+The resulting UCI candidate is:
 
 ```text
 e1g1
@@ -207,7 +261,7 @@ ON → OFF
 
 These transitions are tracked as disturbances.
 
-The latest such square, excluding the movement source itself, is stored as:
+The latest such square, excluding the locked movement source itself, is stored as:
 
 ```cpp
 lastDisturbed
@@ -218,14 +272,14 @@ This is particularly useful when a piece is captured on an already-occupied dest
 For example:
 
 ```text
-Source:          ON → OFF
-Destination:     ON
-Captured piece:  ON → OFF
+Source:       ON → OFF
+Destination:  ON
+Captured:     ON → OFF
 ```
 
 The destination itself does not produce an `OFF → ON` transition because it was already occupied.
 
-`lastDisturbed` provides the additional information needed to construct the UCI candidate.
+`lastDisturbed` provides the additional physical information needed to construct the UCI candidate.
 
 ---
 
@@ -239,6 +293,8 @@ The general process is:
 Sensor State Changes
         ↓
 Identify Source
+        ↓
+Lock Source
         ↓
 Identify First Destination
         ↓
@@ -255,7 +311,7 @@ It simply translates the physical movement pattern into UCI.
 
 ---
 
-## Normal Move
+# Normal Move
 
 For a normal move:
 
@@ -284,7 +340,7 @@ e2e4
 
 ---
 
-## Normal Capture
+# Normal Capture
 
 For a normal capture, the destination square was already occupied.
 
@@ -298,7 +354,7 @@ Destination:  ON
 Captured:     ON → OFF
 ```
 
-The movement detector uses `lastDisturbed` to identify the occupied square that was disturbed after the source was removed.
+The movement detector uses `lastDisturbed` to identify the occupied square that was disturbed after the source was locked.
 
 Conceptually:
 
@@ -326,7 +382,7 @@ The movement detector does not need to label this as a capture.
 
 # En Passant
 
-En passant demonstrates why the movement detector does not require dedicated chess-rule logic.
+En passant demonstrates the importance of **source lock** and `firstDestination`.
 
 Consider:
 
@@ -350,15 +406,25 @@ d6: OFF → ON
 d5: ON → OFF
 ```
 
-The detector records:
+The detector processes these transitions as:
 
 ```text
-movementSource   = e5
+e5: ON → OFF
+        ↓
+movementSource = e5
+        ↓
+SOURCE LOCK
+
+d6: OFF → ON
+        ↓
 firstDestination = d6
-lastDisturbed    = d5
+
+d5: ON → OFF
+        ↓
+lastDisturbed = d5
 ```
 
-The movement candidate is:
+The resulting movement candidate is:
 
 ```text
 e5d6
@@ -366,7 +432,15 @@ e5d6
 
 The detector does not need to determine that the pawn on `d5` is being captured en passant.
 
-`chess.hpp` receives `e5d6` and, based on the current chess position, determines whether the move is a legal en passant capture.
+`chess.hpp` receives:
+
+```text
+e5d6
+```
+
+and, based on the current chess position, determines whether the move is a legal en passant capture.
+
+The important point is that source lock prevents `d5` from being interpreted as a second source.
 
 ---
 
@@ -629,9 +703,11 @@ The detector identifies:
 
 ```text
 movementSource
-        ↓
+      ↓
+  SOURCE LOCK
+      ↓
 firstDestination
-        ↓
+      ↓
 lastDisturbed
 ```
 
@@ -667,6 +743,9 @@ The architecture can therefore be summarized as:
           ▼                     ▼
  movementSource        firstDestination
           │                     │
+          │                FIRST ON→OFF
+          │                DESTINATION LOCK
+          │                     │
           └──────────┬──────────┘
                      │
               Additional
@@ -700,14 +779,15 @@ Its responsibility is limited to:
 1. Observe changes in the 64 sensor states.
 2. Compare those changes against the previous valid baseline.
 3. Identify the first occupied square that becomes empty as `movementSource`.
-4. Identify the first previously-empty square that becomes occupied as `firstDestination` and lock it.
-5. Track subsequent occupied squares that become empty as `lastDisturbed`.
-6. Translate the physical movement into a UCI move candidate.
-7. Pass that candidate to `chess.hpp`.
+4. **Lock the source immediately** so subsequent occupied-square removals cannot be interpreted as another source.
+5. Identify the first previously-empty square that becomes occupied as `firstDestination` and lock it.
+6. Track subsequent occupied squares that become empty as `lastDisturbed`.
+7. Translate the physical movement into a UCI move candidate.
+8. Pass that candidate to `chess.hpp`.
 
 `chess.hpp` is responsible for determining whether the resulting UCI move is legal and for applying the corresponding chess rules.
 
-The result is a clear separation of responsibilities:
+The resulting separation of responsibilities is:
 
 ```text
 ChessGrid Board
